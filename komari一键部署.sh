@@ -15,11 +15,56 @@ LOG_FILE="/tmp/komari_deploy.log"
 RETRY_TIMES=3
 TIMEOUT=30
 
-# 基础日志函数（无美化）
+# 基础日志函数
 log() {
     local MSG="$1"
     local DATE=$(date +%Y-%m-%d_%H:%M:%S)
     echo "[$DATE] $MSG" | tee -a "${LOG_FILE}"
+}
+
+# 新增：展示证书时间+自动续约状态（Komari前强制核对）
+show_cert_info() {
+    log "==================== 证书信息核对 ===================="
+    # 服务器IP
+    local SERVER_IP=$(curl -s icanhazip.com 2>/dev/null || hostname -I | awk '{print $1}')
+    echo "服务器公网IP：${SERVER_IP}"
+    echo "部署域名：${DOMAIN}"
+    echo "证书绑定邮箱：${EMAIL}"
+    
+    # 证书时间检测
+    if [ -f "${SSL_DIR}/${DOMAIN}.crt" ]; then
+        local CERT_START=$(openssl x509 -in "${SSL_DIR}/${DOMAIN}.crt" -noout -startdate | cut -d= -f2)
+        local CERT_END=$(openssl x509 -in "${SSL_DIR}/${DOMAIN}.crt" -noout -enddate | cut -d= -f2)
+        local END_TIMESTAMP=$(date -d "${CERT_END}" +%s 2>/dev/null)
+        local NOW_TIMESTAMP=$(date +%s)
+        if [ -n "${END_TIMESTAMP}" ] && [ "${END_TIMESTAMP}" -gt "${NOW_TIMESTAMP}" ]; then
+            local CERT_DAYS=$(( (END_TIMESTAMP - NOW_TIMESTAMP) / 86400 ))
+            echo "证书生效时间：${CERT_START}"
+            echo "证书过期时间：${CERT_END}"
+            echo "证书剩余有效期：${CERT_DAYS} 天"
+        else
+            echo "证书状态：已存在，但有效期解析失败（请手动验证）"
+        fi
+    else
+        echo "证书状态：未生成（将在后续步骤申请）"
+    fi
+
+    # 新增：检测acme.sh自动续约定时任务（核心）
+    echo -e "\n==== 自动续约检测 ===="
+    if crontab -l 2>/dev/null | grep -q "${ACME_EXEC} --cron"; then
+        echo "✅ 自动续约定时任务已生效（每天0点执行续约）"
+    else
+        echo "❌ 自动续约定时任务未配置！"
+    fi
+
+    # 强制确认：必须输入y才继续
+    read -p $'\n以上证书信息已核对，是否继续部署？(y/n)：' CHOICE
+    case "${CHOICE}" in
+        y|Y) log "确认继续部署";;
+        n|N) log "用户取消部署，脚本退出"; exit 0;;
+        *) log "输入无效，脚本退出"; exit 1;;
+    esac
+    log "======================================================"
 }
 
 # 下载重试
@@ -97,7 +142,7 @@ fix_ssl_ca_and_time() {
     log "CA证书/时间修复完成"
 }
 
-# 安装acme.sh
+# 安装acme.sh（确保自动续约任务被配置）
 install_acme_sh_manual() {
     log "安装acme.sh"
     mkdir -p "${ACME_DIR}"; chmod 700 "${ACME_DIR}"
@@ -106,8 +151,10 @@ install_acme_sh_manual() {
     chmod +x "${ACME_EXEC}"
     "${ACME_EXEC}" --set-default-ca --server zerossl 2>/dev/null
     "${ACME_EXEC}" --register-account -m "${EMAIL}" --force 2>/dev/null
-    if ! crontab -l | grep -q "${ACME_EXEC} --cron"; then
+    # 强制配置自动续约定时任务（避免漏配）
+    if ! crontab -l 2>/dev/null | grep -q "${ACME_EXEC} --cron"; then
         (crontab -l 2>/dev/null; echo "0 0 * * * ${ACME_EXEC} --cron --log ${LOG_FILE} > /dev/null") | crontab -
+        log "已配置自动续约定时任务（每天0点执行）"
     fi
     log "acme.sh安装完成"
 }
@@ -138,13 +185,11 @@ check_nginx_gzip_module() {
     fi
 }
 
-# 配置Nginx（核心：压缩+反向代理）
+# 配置Nginx
 config_nginx() {
     log "配置Nginx"
     backup_file "/etc/nginx/nginx.conf"
     backup_file "/etc/nginx/conf.d/komari.conf"
-    
-    # 写入Nginx主配置（强制开启Gzip压缩）
     cat > /etc/nginx/nginx.conf << EOF
 user www-data;
 worker_processes auto;
@@ -157,7 +202,6 @@ events {
 }
 
 http {
-    # Gzip压缩核心配置
     gzip on;
     gzip_vary on;
     gzip_comp_level 9;
@@ -177,8 +221,6 @@ http {
     include /etc/nginx/conf.d/*.conf;
 }
 EOF
-
-    # 写入Komari反向代理配置
     cat > /etc/nginx/conf.d/komari.conf << EOF
 server {
     listen 80;
@@ -202,8 +244,6 @@ server {
     }
 }
 EOF
-
-    # 强化安全头+重启Nginx
     if [ -f "/etc/nginx/sites-enabled/default" ]; then
         rm -f "/etc/nginx/sites-enabled/default"; log "已删默认配置"
     fi
@@ -249,7 +289,7 @@ fi
 # 端口检查
 check_port_used
 
-# 输入域名（仅核心提示）
+# 输入域名
 log "请先解析域名到本服务器公网IP"
 read -p "请输入你的域名：" DOMAIN
 while [ -z "${DOMAIN}" ] || ! echo "${DOMAIN}" | grep -qE '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'; do
@@ -276,13 +316,26 @@ apt install -y curl wget nano nginx-full socat cron openssl 2>/dev/null
 log "基础工具安装完成"
 
 # 检查Gzip模块
-check_nginx_gzip_module
+check_nginx_gzip_module() {
+    log "检查Gzip模块"
+    NGINX_V_OUTPUT=$(nginx -V 2>&1)
+    if echo "${NGINX_V_OUTPUT}" | grep -q -- "--with-http_gzip"; then
+        log "Gzip模块已加载"
+    else
+        log "Debian nginx-full默认包含Gzip功能"
+    fi
+}
 
 # 安装acme.sh
 if [ ! -f "${ACME_EXEC}" ]; then
     install_acme_sh_manual
 else
     log "acme.sh已安装"
+    # 检查已安装的acme.sh是否配置了自动续约
+    if ! crontab -l 2>/dev/null | grep -q "${ACME_EXEC} --cron"; then
+        (crontab -l 2>/dev/null; echo "0 0 * * * ${ACME_EXEC} --cron --log ${LOG_FILE} > /dev/null") | crontab -
+        log "补全自动续约定时任务"
+    fi
 fi
 
 # 申请SSL证书
@@ -304,7 +357,10 @@ cp -f "${ACME_CERT_PATH}/fullchain.cer" "${SSL_DIR}/${DOMAIN}.crt"
 chmod 600 "${SSL_DIR}/${DOMAIN}.key"
 verify_ssl_cert
 
-# Komari安装逻辑（核心修复：选y正常覆盖，选n直接配置Nginx）
+# ========== 核心修复：强制展示证书信息+续约检测，确认后才继续 ==========
+show_cert_info
+
+# Komari安装逻辑
 log "检查Komari安装状态"
 if [ -f "/opt/komari/komari" ]; then
     read -p "Komari已安装，是否覆盖？(y/n)：" CHOICE
@@ -316,7 +372,6 @@ if [ -f "/opt/komari/komari" ]; then
             chmod +x install-komari.sh; ./install-komari.sh -q 2>&1 | tee komari_install.log
             log "Komari覆盖完成"
             
-            # 提取密码+配置服务
             extract_komari_password
             log "配置Komari服务"
             backup_file "/etc/systemd/system/komari.service"
@@ -358,7 +413,6 @@ else
     chmod +x install-komari.sh; ./install-komari.sh -q 2>&1 | tee komari_install.log
     log "Komari全新安装完成"
     
-    # 提取密码+配置服务
     extract_komari_password
     log "配置Komari服务"
     backup_file "/etc/systemd/system/komari.service"
@@ -388,7 +442,7 @@ EOF
     fi
 fi
 
-# 无论是否安装Komari，都执行Nginx配置（核心：压缩+反向代理）
+# 配置Nginx
 config_nginx
 
 # 服务状态检查
